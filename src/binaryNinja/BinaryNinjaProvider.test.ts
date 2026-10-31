@@ -1,7 +1,7 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { parseConfig } from "../config/parseConfig.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import { readBinaryNinjaConfiguration } from "./BinaryNinjaConfiguration.js";
@@ -12,21 +12,15 @@ import {
   RecordingBinaryNinjaMcp,
 } from "../../tests/fixtures/binaryNinjaMcp.js";
 
-const roots: string[] = [];
 const resourceScope = {
   run: <T>(operation: () => Promise<T>) => operation(),
   retain: () => {
     throw new Error("Unexpected retained configuration descriptor");
   },
 };
-afterEach(async () => {
-  for (const root of roots.splice(0))
-    await rm(root, { recursive: true, force: true });
-});
 
 const registration = async (value: unknown) => {
-  const root = await mkdtemp(join(tmpdir(), "rea-binary-ninja-config-"));
-  roots.push(root);
+  const root = await createTestTempDirectory("rea-binary-ninja-config-");
   const path = join(root, "binary-ninja-mcp.json");
   await writeFile(path, JSON.stringify(value));
   return path;
@@ -99,6 +93,32 @@ describe("Binary Ninja registration", () => {
   });
 });
 
+it("reports malformed headers as unavailable and observes a repaired registration", async () => {
+  const path = await registration({
+    url: "http://127.0.0.1:24642/mcp",
+    headers: { Authorization: "Bearer private-token\ninvalid" },
+  });
+  const candidate = provider(path);
+  const availability = await candidate.inspectAvailability();
+  expect(availability).toMatchObject({
+    status: "unavailable",
+    code: "open_options_invalid",
+  });
+  expect(JSON.stringify(availability)).not.toContain("private-token");
+  expect(await candidate.resolveAnalysisProfile(pe(false))).toMatchObject({
+    ok: false,
+    error: { _tag: "ConfigurationError" },
+  });
+  await writeFile(
+    path,
+    JSON.stringify({
+      url: "http://127.0.0.1:24642/mcp",
+      headers: { Authorization: " Bearer repaired " },
+    }),
+  );
+  expect((await candidate.inspectAvailability()).status).toBe("available");
+});
+
 describe("Binary Ninja provider", () => {
   it("preserves the reason when profile resolution is already cancelled", async () => {
     const controller = new AbortController();
@@ -124,8 +144,7 @@ describe("Binary Ninja provider", () => {
   });
 
   it("binds inspected credentials to the selected target/profile and refreshes the next scope", async () => {
-    const { root, target, bytes } = await createBinaryNinjaTarget();
-    roots.push(root);
+    const { target, bytes } = await createBinaryNinjaTarget();
     const path = await registration({
       url: "http://127.0.0.1:24642/mcp",
       headers: { Authorization: "Bearer initial" },
@@ -134,7 +153,7 @@ describe("Binary Ninja provider", () => {
     if (!config.ok) throw config.error;
     const credentials: string[] = [];
     const candidate = new BinaryNinjaProvider(config.value, (registration) => {
-      credentials.push(registration.headers.Authorization!);
+      credentials.push(registration.headers.authorization!);
       return new RecordingBinaryNinjaMcp(target, bytes);
     });
     const scope = new ProviderInspectionScope();
@@ -250,8 +269,7 @@ describe("Binary Ninja provider", () => {
 });
 
 const regexFixture = async (deadlineMs = 5000) => {
-  const { root, target, bytes } = await createBinaryNinjaTarget();
-  roots.push(root);
+  const { target, bytes } = await createBinaryNinjaTarget();
   const path = await registration({ url: "http://127.0.0.1:24642/mcp" });
   const config = parseConfig({
     REA_BINARY_NINJA_MCP_CONFIG: path,

@@ -70,14 +70,25 @@ export const readBinaryNinjaConfiguration = (
           ),
         );
       const parsed = registrationSchema.safeParse(servers[0]);
-      return parsed.success
-        ? ok(parsed.data)
-        : err(
-            binaryNinjaConfigurationError(
-              "REA_BINARY_NINJA_MCP_CONFIG must contain the Binary Ninja GUI MCP url and optional Authorization header; see docs/binary-ninja.md.",
-              parsed.error,
-            ),
-          );
+      if (!parsed.success)
+        return err(
+          binaryNinjaConfigurationError(
+            "REA_BINARY_NINJA_MCP_CONFIG must contain the Binary Ninja GUI MCP url and optional Authorization header; see docs/binary-ninja.md.",
+            parsed.error,
+          ),
+        );
+      try {
+        const headers = Object.fromEntries(new Headers(parsed.data.headers));
+        return ok({ ...parsed.data, headers });
+      } catch {
+        // Fetch's exception can contain the rejected name/value, including
+        // credentials. Return only schema-owned guidance, without that cause.
+        return err(
+          binaryNinjaConfigurationError(
+            "REA_BINARY_NINJA_MCP_CONFIG headers must use valid HTTP names and values (no newlines or non-byte characters); see docs/binary-ninja.md.",
+          ),
+        );
+      }
     },
   });
 

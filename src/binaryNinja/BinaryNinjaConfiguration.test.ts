@@ -1,12 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { createTestTempDirectory } from "../../tests/fixtures/temporaryDirectory.js";
+import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RetainedResourceScope } from "../application/AnalysisProvider.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { readBinaryNinjaConfiguration } from "./BinaryNinjaConfiguration.js";
 
-const roots: string[] = [];
 const resourceScope: RetainedResourceScope = {
   run: (operation) => operation(),
   retain: () => {
@@ -14,20 +13,70 @@ const resourceScope: RetainedResourceScope = {
   },
 };
 const fixture = async () => {
-  const root = await mkdtemp(join(tmpdir(), "rea-bn-registration-"));
-  roots.push(root);
+  const root = await createTestTempDirectory("rea-bn-registration-");
   const path = join(root, "mcp.json");
   const registration = JSON.stringify({ url: "http://127.0.0.1:24642/mcp" });
   await writeFile(path, registration);
   return { root, path, registration };
 };
-afterEach(async () => {
+afterEach(() => {
   vi.restoreAllMocks();
-  for (const root of roots.splice(0))
-    await rm(root, { recursive: true, force: true });
 });
 
 describe("Binary Ninja registration ownership", () => {
+  it.each([
+    { "bad name": "secret-header-value" },
+    { "": "secret-header-value" },
+    { Authorization: "Bearer secret-header-value\r\ninjected: true" },
+    { Authorization: "Bearer secret-header-value\u0100" },
+  ])(
+    "rejects invalid Fetch headers without exposing credentials: %#",
+    async (headers) => {
+      const { path } = await fixture();
+      await writeFile(
+        path,
+        JSON.stringify({ url: "http://127.0.0.1:24642/mcp", headers }),
+      );
+      const result = await readBinaryNinjaConfiguration(path, {
+        resourceScope,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          _tag: "ConfigurationError",
+          message: expect.stringContaining("headers"),
+          settings: [{ setting: "REA_BINARY_NINJA_MCP_CONFIG" }],
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain("secret-header-value");
+      if (!result.ok) expect(result.error.cause).toBeUndefined();
+    },
+  );
+
+  it("normalizes Fetch header names and values before returning a registration", async () => {
+    const { path } = await fixture();
+    await writeFile(
+      path,
+      JSON.stringify({
+        url: "http://127.0.0.1:24642/mcp",
+        headers: {
+          Authorization: "  Bearer test-token \t",
+          "X-Analysis": " ordinary text ",
+        },
+      }),
+    );
+    const result = await readBinaryNinjaConfiguration(path, { resourceScope });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        headers: {
+          authorization: "Bearer test-token",
+          "x-analysis": "ordinary text",
+        },
+      },
+    });
+  });
+
   it("bounds the descriptor read and rejects non-regular inputs", async () => {
     const { root, path, registration } = await fixture();
     await writeFile(path, registration.padEnd(65_536));

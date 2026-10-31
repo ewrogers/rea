@@ -1,4 +1,3 @@
-import { rm } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createBinaryNinjaTarget,
@@ -32,11 +31,8 @@ vi.mock("node:v8", async (importOriginal) => {
   };
 });
 
-const roots: string[] = [];
-afterEach(async () => {
+afterEach(() => {
   heapCapacity.available = undefined;
-  for (const root of roots.splice(0))
-    await rm(root, { recursive: true, force: true });
 });
 
 const config: BinaryNinjaConfiguration = {
@@ -47,8 +43,7 @@ const config: BinaryNinjaConfiguration = {
 };
 
 const fixture = async (settings: Partial<BinaryNinjaConfiguration> = {}) => {
-  const { root, target, bytes } = await createBinaryNinjaTarget();
-  roots.push(root);
+  const { target, bytes } = await createBinaryNinjaTarget();
   const producer = new RecordingBinaryNinjaMcp(target, bytes);
   const client = new BinaryNinjaSessionClient(
     { ...config, ...settings },

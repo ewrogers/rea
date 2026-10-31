@@ -1,6 +1,6 @@
+import { createTestTempDirectory } from "./temporaryDirectory.js";
 import { createHash } from "node:crypto";
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { BinaryTarget } from "../../src/domain/binaryTargetTypes.js";
 import type { JsonValue } from "../../src/domain/jsonValue.js";
@@ -18,7 +18,7 @@ import { elf } from "../../src/domain/binaryTarget.fixture.js";
 
 /** Create a test-owned executable without invoking an engine. */
 export const createBinaryNinjaTarget = async () => {
-  const root = await mkdtemp(join(tmpdir(), "rea-binary-ninja-test-"));
+  const root = await createTestTempDirectory("rea-binary-ninja-test-");
   const path = join(root, "target.elf");
   const bytes = elf(2, 1, 62);
   await writeFile(path, bytes);
@@ -30,7 +30,7 @@ export const createBinaryNinjaTarget = async () => {
     architecture: "x86_64",
     availableArchitectures: ["x86_64"],
   };
-  return { root, target, bytes };
+  return { target, bytes };
 };
 
 interface FixtureFunction {
