@@ -68,7 +68,77 @@ const value = async (
   return result.value;
 };
 
+it.each([
+  "list_procedures",
+  "procedure_pseudo_code",
+  "procedure_assembly",
+] as const)(
+  "rejects paged %s before retaining replies beyond available capacity",
+  async (operation) => {
+    const { client, producer } = await fixture();
+    await value(client, "list_procedures");
+    const original = producer.call.bind(producer);
+    let pages = 0;
+    producer.call = async (name, args) => {
+      const reply = await original(name, args);
+      const tool =
+        operation === "list_procedures"
+          ? "bn_function_list"
+          : operation === "procedure_pseudo_code"
+            ? "bn_function_decompile"
+            : "bn_function_disassembly";
+      if (name === tool) {
+        pages++;
+        heapCapacity.available = 1;
+      }
+      return reply;
+    };
+    try {
+      const result = await client.execute(
+        operation,
+        operation === "list_procedures" ? {} : { procedure: "0x401000" },
+      );
+      expect(result).toMatchObject({
+        ok: false,
+        error: { _tag: "AnalysisResourceConstraintError" },
+      });
+      expect(pages).toBe(1);
+    } finally {
+      heapCapacity.available = undefined;
+      expect((await client.close()).ok).toBe(true);
+    }
+  },
+);
+
 describe("Binary Ninja target binding", () => {
+  it("accounts for earlier pages when admitting the next inventory page", async () => {
+    const { client, producer } = await fixture();
+    await value(client, "list_procedures");
+    const template = producer.functions[0]!;
+    producer.functions = Array.from({ length: 30 }, (_, index) => ({
+      ...template,
+      address: `0x${(0x401000 + index * 256).toString(16)}`,
+      name: "f".repeat(400),
+    }));
+    producer.pageSize = 1;
+    heapCapacity.available = 100000;
+    const start = producer.calls.length;
+    try {
+      expect(await client.execute("list_procedures", {})).toMatchObject({
+        ok: false,
+        error: { _tag: "AnalysisResourceConstraintError" },
+      });
+      const pages = producer.calls
+        .slice(start)
+        .filter(({ name }) => name === "bn_function_list");
+      expect(pages.length).toBeGreaterThan(1);
+      expect(pages.length).toBeLessThan(30);
+    } finally {
+      heapCapacity.available = undefined;
+      expect((await client.close()).ok).toBe(true);
+    }
+  });
+
   it("binds the open file by its Raw view digest and never calls mutation tools", async () => {
     const { client, producer } = await fixture();
     const execution = await value(client, "procedure_address", {
@@ -574,7 +644,7 @@ it("rejects missing chunk bytes instead of returning zero-filled string content"
 describe("Binary Ninja string capacity", () => {
   it("admits string inventories against combined memory use before reading bytes", async () => {
     const { client, producer } = await fixture();
-    heapCapacity.available = 60000;
+    heapCapacity.available = 250000;
     producer.strings = [
       {
         address: "0x500000",
@@ -595,7 +665,7 @@ describe("Binary Ninja string capacity", () => {
         ok: false,
         error: {
           _tag: "AnalysisResourceConstraintError",
-          reportedLimits: { required_bytes: "106496", available_bytes: 60000 },
+          reportedLimits: { available_bytes: 250000 },
         },
       });
       expect(

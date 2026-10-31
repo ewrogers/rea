@@ -61,11 +61,17 @@ const toolResultSchema = z.object({
 
 const MAX_DIAGNOSTIC_CHARACTERS = 4096;
 
-/** Remove every configured header value, and a bearer token alone, from diagnostics. */
+/** Redact authentication values as Fetch sends them, preserving non-secret headers. */
 export const createBinaryNinjaRedactor = (
-  headers: Readonly<Record<string, string>>,
+  headers: Readonly<Record<string, string>> | Headers,
 ): ((text: string) => string) => {
-  const secrets = Object.values(headers)
+  const normalized =
+    headers instanceof Headers ? headers : new Headers(headers);
+  const secrets = [...normalized.entries()]
+    .filter(([name]) =>
+      ["authorization", "proxy-authorization", "cookie"].includes(name),
+    )
+    .map(([, value]) => value)
     .flatMap((value) => {
       const bearer = /^Bearer\s+(.+)$/iu.exec(value)?.[1];
       return bearer === undefined ? [value] : [value, bearer];
@@ -86,6 +92,7 @@ export const createBinaryNinjaRedactor = (
 export const decodeBinaryNinjaToolResult = (
   tool: string,
   input: unknown,
+  redact: (text: string) => string = (text) => text,
 ): BinaryNinjaToolReply => {
   const result = toolResultSchema.parse(input);
   if (result.content.some((block) => block.type !== "text"))
@@ -111,9 +118,9 @@ export const decodeBinaryNinjaToolResult = (
     const parsed = binaryNinjaToolErrorSchema.safeParse(error);
     throw parsed.success
       ? new BinaryNinjaToolError(
-          tool,
-          parsed.data.errorCode,
-          parsed.data.errorMessage,
+          redact(tool),
+          redact(parsed.data.errorCode),
+          redact(parsed.data.errorMessage),
         )
       : new AnalysisProtocolError(
           `Binary Ninja ${tool} failed without a machine-readable error code.`,
@@ -134,9 +141,10 @@ export const createBinaryNinjaMcpConnection = (
     name: "rea-binary-ninja-provider",
     version: "1",
   });
-  const redact = createBinaryNinjaRedactor(config.headers);
+  const headers = new Headers(config.headers);
+  const redact = createBinaryNinjaRedactor(headers);
   const transport = new StreamableHTTPClientTransport(new URL(config.url), {
-    requestInit: { headers: config.headers, redirect: "error" },
+    requestInit: { headers, redirect: "error" },
   });
   const throwIfCancelled = (
     operation: string,
@@ -218,7 +226,12 @@ export const createBinaryNinjaMcpConnection = (
       const result = await client
         .callTool({ name, arguments: { ...args } }, options(signal))
         .catch((cause: unknown) => failure(cause, name, signal));
-      return decodeBinaryNinjaToolResult(name, result);
+      try {
+        return decodeBinaryNinjaToolResult(name, result, redact);
+      } catch (cause: unknown) {
+        if (cause instanceof BinaryNinjaToolError) throw cause;
+        return failure(cause, name, signal);
+      }
     },
     serverInfo: () => jsonValueSchema.parse(client.getServerVersion() ?? null),
     close: () =>

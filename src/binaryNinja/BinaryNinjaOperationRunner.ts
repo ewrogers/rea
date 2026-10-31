@@ -97,6 +97,32 @@ interface Relationships {
 const INSTRUCTION_LINE = /^(0x[0-9a-f]+) {2}(.*)$/iu;
 const isHexAddress = (value: string): boolean => /^0x[0-9a-f]+$/iu.test(value);
 
+/** Estimate without serializing or copying the reply being admitted. */
+const retainedReplyCapacity = (value: JsonValue): bigint => {
+  // Per UTF-16 unit: retained/parsed/normalized text (8 bytes), plus two
+  // Evidence serializations at worst-case JSON escaping (2 * 6 * 2 bytes).
+  // Object/array slots also cover normalized rows and their later copies.
+  if (typeof value === "string") {
+    // Rendered pages also become arrays of rows/lines; reserve their object
+    // and array-slot overhead even when each line contains very little text.
+    let lines = 1;
+    for (let index = 0; index < value.length; index++)
+      if (value.charCodeAt(index) === 10) lines++;
+    return BigInt(value.length) * 32n + BigInt(lines) * 128n + 256n;
+  }
+  if (value === null || typeof value !== "object") return 256n;
+  let bytes = 256n;
+  if (Array.isArray(value)) {
+    for (const item of value) bytes += retainedReplyCapacity(item);
+  } else {
+    for (const key in value)
+      if (Object.hasOwn(value, key))
+        bytes +=
+          retainedReplyCapacity(key) + retainedReplyCapacity(value[key]!);
+  }
+  return bytes;
+};
+
 /** Translate explicit analyst questions into a closed set of read-only Binary Ninja requests. */
 export class BinaryNinjaOperationRunner {
   readonly raw: BinaryNinjaRawObservation[] = [];
@@ -105,6 +131,7 @@ export class BinaryNinjaOperationRunner {
   relationshipCoverage: RelationshipCoverage | undefined;
   /** Whether the last `xrefs` read may omit references; never part of Evidence. */
   referencesTruncated: boolean | undefined;
+  private retainedCapacity = 0n;
 
   constructor(
     private readonly connection: BinaryNinjaMcpConnection,
@@ -126,6 +153,12 @@ export class BinaryNinjaOperationRunner {
   ): Promise<BinaryNinjaToolReply> {
     this.throwIfCancelled(tool);
     const reply = await this.connection.call(tool, args, this.options.signal);
+    const required =
+      retainedReplyCapacity(reply.text) +
+      retainedReplyCapacity(reply.structured) +
+      retainedReplyCapacity(args);
+    this.requireCapacity(tool, this.retainedCapacity + required);
+    this.retainedCapacity += required;
     this.raw.push({
       tool,
       arguments: args,
@@ -373,33 +406,23 @@ export class BinaryNinjaOperationRunner {
       readonly row: Readonly<Record<string, string>>;
     }[],
   ): void {
-    const heap = getHeapStatistics();
-    const hostAvailable =
-      typeof process.availableMemory === "function"
-        ? process.availableMemory()
-        : heap.total_available_size;
-    const availableBytes = Math.max(
-      0,
-      Math.floor(Math.min(heap.total_available_size, hostAvailable)),
-    );
     let requiredBytes = 0n;
     for (const { length, row } of entries) {
-      // Per input byte: buffer (1), decoded UTF-16 (2), retained text/hex
-      // replies (8), and two serialized Evidence representations (2 * 20).
-      // The serialization allowance includes worst-case JSON escaping.
+      // Both rendered and structured replies can retain two hex units per
+      // input byte (4 * the shared 32-byte allowance), plus the buffer,
+      // decoded text and normalized/serialized result (another 32 bytes).
       // Reserve 1 KiB per chunk for its reply envelope and retained objects.
       const chunks =
         (length + BigInt(BINARY_NINJA_MEMORY_READ_LIMIT) - 1n) /
         BigInt(BINARY_NINJA_MEMORY_READ_LIMIT);
-      requiredBytes += length * 51n + chunks * 1024n;
+      requiredBytes += length * 160n + chunks * 1024n;
       const codeUnits =
         row.type === "Utf32String" || row.type === "Utf16String"
           ? length / 2n
           : length;
       if (
         length > BigInt(bufferConstants.MAX_LENGTH) ||
-        codeUnits > BigInt(bufferConstants.MAX_STRING_LENGTH) ||
-        requiredBytes > BigInt(availableBytes)
+        codeUnits > BigInt(bufferConstants.MAX_STRING_LENGTH)
       )
         throw new AnalysisResourceConstraintError(
           "binary_ninja_strings",
@@ -407,8 +430,6 @@ export class BinaryNinjaOperationRunner {
           "Insufficient runtime capacity for the complete string inventory, retained replies, and serialized Evidence.",
           {
             required_bytes: requiredBytes.toString(),
-            available_bytes: availableBytes,
-            available_heap_bytes: heap.total_available_size,
             maximum_buffer_bytes: bufferConstants.MAX_LENGTH,
             maximum_string_code_units: bufferConstants.MAX_STRING_LENGTH,
           },
@@ -418,6 +439,44 @@ export class BinaryNinjaOperationRunner {
           },
         );
     }
+    this.requireCapacity(
+      "binary_ninja_strings",
+      this.retainedCapacity + requiredBytes,
+    );
+  }
+
+  /** All reads share the retained-reply and future Evidence capacity budget. */
+  private requireCapacity(operation: string, requiredBytes: bigint): void {
+    const heap = getHeapStatistics();
+    const hostAvailable =
+      typeof process.availableMemory === "function"
+        ? process.availableMemory()
+        : heap.total_available_size;
+    const availableBytes = Math.max(
+      0,
+      Math.floor(Math.min(heap.total_available_size, hostAvailable)),
+    );
+    // The estimate includes two serialized strings; neither may exceed V8's
+    // string ceiling even when the host has enough free memory.
+    if (
+      requiredBytes > BigInt(availableBytes) ||
+      requiredBytes > BigInt(bufferConstants.MAX_STRING_LENGTH) * 4n
+    )
+      throw new AnalysisResourceConstraintError(
+        operation,
+        "memory",
+        "Insufficient runtime capacity for retained Binary Ninja replies, normalized results, and serialized Evidence.",
+        {
+          required_bytes: requiredBytes.toString(),
+          available_bytes: availableBytes,
+          available_heap_bytes: heap.total_available_size,
+          maximum_string_code_units: bufferConstants.MAX_STRING_LENGTH,
+        },
+        {
+          remediationAction:
+            "Free memory or raise the Node.js heap allowance for REA, then retry.",
+        },
+      );
   }
 
   private async read(address: string, length: number): Promise<Buffer> {

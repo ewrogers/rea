@@ -16,7 +16,10 @@ afterEach(async () => {
 });
 
 /** Loopback server that enforces the real GUI server's protocol and bearer checks. */
-const startServer = async (onRequest?: (method: string) => void) => {
+const startServer = async (
+  onRequest?: (method: string) => void,
+  toolError = "No matching function was found",
+) => {
   const seen: {
     authorization: string | undefined;
     protocol: string | undefined;
@@ -78,7 +81,7 @@ const startServer = async (onRequest?: (method: string) => void) => {
         ],
         structuredContent: {
           errorCode: "function_not_found",
-          errorMessage: "No matching function was found",
+          errorMessage: toolError,
         },
         isError: true,
       };
@@ -145,7 +148,7 @@ describe("Binary Ninja MCP connection", () => {
   it("never reports the configured token in transport failures", async () => {
     const { url } = await startServer();
     const connection = createBinaryNinjaMcpConnection(
-      config(url, "wrong-secret-456"),
+      config(url, "wrong-secret-456 "),
     );
     const failure = await connection.connect().catch((cause: unknown) => cause);
     expect(failure).toBeInstanceOf(Error);
@@ -159,6 +162,34 @@ describe("Binary Ninja MCP connection", () => {
 });
 
 describe("Binary Ninja tool results", () => {
+  it("redacts normalized credentials in decoded errors and preserves ordinary text", async () => {
+    const { url } = await startServer(
+      undefined,
+      `rejected Bearer ${TOKEN}; application/json`,
+    );
+    const registration = config(url, TOKEN + " ");
+    const connection = createBinaryNinjaMcpConnection({
+      ...registration,
+      headers: { ...registration.headers, Accept: "application/json" },
+    });
+    try {
+      await connection.connect();
+      const failure = await connection
+        .call("bn_function_info", {})
+        .catch((cause: unknown) => cause);
+      expect(failure).toBeInstanceOf(BinaryNinjaToolError);
+      expect(JSON.stringify(failure)).not.toContain(TOKEN);
+      expect((failure as Error).message).toContain("application/json");
+      expect(
+        decodeBinaryNinjaToolResult("bn_x", {
+          content: [{ type: "text", text: TOKEN }],
+        }).text,
+      ).toBe(TOKEN);
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("rejects an error without a machine-readable code and non-text content", () => {
     expect(() =>
       decodeBinaryNinjaToolResult("bn_x", {
